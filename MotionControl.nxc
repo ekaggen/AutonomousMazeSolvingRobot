@@ -1,0 +1,1017 @@
+#include "NXCDefs.h"
+#include "BTlib.nxc"
+#define BT_CONN 1
+#define MAILBOX 0
+#define SECONDARY_MAILBOX 1
+
+#define STRAIGHT 0
+#define CCW 1
+#define CW 2
+
+#define LEFT OUT_B
+#define RIGHT OUT_A
+
+#define WHEEL_DIAMETER 2.23
+#define ROBOT_DIAMETER 8.4
+
+#define LEFT_SENSOR 2
+#define RIGHT_SENSOR 0
+#define CENTER_SENSOR 1
+
+#define PID_MODE 1
+#define INTERSECTION_MODE 2
+unsigned int sensorsHigh[] = {529, 500, 557};
+unsigned int sensorsLow[] = {296, 200, 275};
+unsigned int threshHigh[] = {200, 200, 200};
+unsigned int threshLow[] = {200, 200, 200};
+string curCondition = "";
+
+// Sends a packet with the payload buf over the BT connection
+sub sendPacket(byte buf[])
+{
+	until(BluetoothStatus(0)==NO_ERR);
+	BluetoothWrite(0, buf);
+}
+
+// Process a message, respond right away to a GET TICKS request
+sub messageProcess()
+{
+	string in = BTReceiveMessage(0, SECONDARY_MAILBOX, TRUE);
+	if(in == "GET TICKS")
+	{
+		byte buf[] = {0x00, 0xAB, 0x1C, 0xAA, 0xEE, 0xAA, 0xAB, 0xAA, 0xEE, 0xAA, 0xAB, 0xAA, 0xEE, 0xAA, 0xAB};
+		BluetoothWrite(0, buf);
+	}
+}
+
+string checkSecondary()
+{
+	string in = BTReceiveMessage(0, SECONDARY_MAILBOX, TRUE);
+	return SubStr(in, 4, StrLen(in)-4);
+}
+bool meetsCondition(string condition)
+{
+	bool l = Sensor(LEFT_SENSOR) < threshLow[LEFT_SENSOR];
+	bool r = Sensor(RIGHT_SENSOR) < threshLow[RIGHT_SENSOR];
+	bool c = Sensor(CENTER_SENSOR) < threshLow[CENTER_SENSOR];
+	if(condition == "")
+	{
+		return false;
+	}
+	else if(condition[0] == 'I')
+	{
+		if(!c || (!l && !r))
+		{
+			return false;
+		}
+
+		if(l && condition == "IR") return false;
+		if(r &&condition == "IL") return false;
+		if(!l && (condition == "ILR" || condition == "IL")) return false;
+		if(!r && (condition == "ILR" || condition == "IR")) return false;
+		
+		if(MotorRotationCount(LEFT) < 140) {Off(LEFT);Off(RIGHT);Wait(20000);}
+		return true;
+	}
+	else if(condition == "D")
+	{
+		if(Sensor(CENTER_SENSOR) > threshHigh[CENTER_SENSOR])
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+sub checkBT(int conn)
+{
+	if(!BTCommCheck(conn))
+	{
+		TextOut(10, LCD_LINE3, "Bluetooth is");
+		TextOut(10, LCD_LINE4, "not connected");
+		Wait(4000);
+		Stop(true);
+	}
+}
+bool beginsWith(string str, string target)
+{
+	int len = StrLen(target);
+	string comp = SubStr(str, 0, len);
+	return (comp == target);
+}
+
+//1355.926 deg per rotation, wheel diameter is 2.23in
+string getToken(string delim, string str, int nToken)
+{
+	int i = 0;
+	int pos = 0;
+	string strPart = str;
+	while(true)
+	{
+		int strPartLen = StrLen(strPart) - pos;
+		strPart = SubStr(strPart, pos, strPartLen);
+		int nextDelim = Pos(delim, strPart);
+		//TextOut(0, LCD_LINE3, "                 ");
+		//TextOut(0, LCD_LINE3, strPart);
+		if(i == nToken)
+		{
+			if(nextDelim == -1)
+			{
+				return strPart;
+			}
+			else
+			{
+				return SubStr(strPart, 0, nextDelim);
+			}
+		}
+		pos = nextDelim + 1;
+		i++;
+	}
+}
+
+bool testGoal(int value, int goal)
+{
+	if(meetsCondition(curCondition)) return true;
+	if(goal < 0)
+	{
+		return value < goal;
+	}
+	else
+	{
+		return value > goal;
+	}
+}
+
+int getDegFromInches(int inches)
+{
+	return inches / WHEEL_DIAMETER * 360 / PI;
+}
+
+int getDegFromRotate(int rotDeg, float surfaceConst)
+{
+	return surfaceConst * ROBOT_DIAMETER / WHEEL_DIAMETER * rotDeg / 2;
+}
+sub windDown()
+{
+	byte outputs[] = {LEFT, RIGHT};
+	// Set motor speeds
+	OnFwd(outputs, 20);
+
+	int startLeft = MotorRotationCount(LEFT);
+	int left = startLeft;
+	int amount = getDegFromInches(2);
+
+
+	while(left < startLeft + amount)
+	{
+		left = MotorRotationCount(LEFT);
+		Wait(10);
+	}
+	Off(outputs);
+}
+
+int rampUp = 1000;
+sub moveStraightPID(int targetDeg, int basePowerHigh, int basePowerLow, int lowThreshDeg, float Kp, float Ki, float Kd)
+{
+	// Left and right ticks
+	int left = 0;
+	int right = 0;
+
+	// Keeping track of errors
+	unsigned long lastTick = 0;
+	unsigned long curTick = 0;
+	int lastError = 0;
+	int dt = 0;
+
+	int totalError = 0; // The integral
+
+	// Setting up our outputs
+	byte outputs[] = {LEFT, RIGHT};
+	ResetAllTachoCounts(outputs);
+
+	// The base power
+	int basePower = basePowerHigh;
+	basePower = basePowerLow;
+
+	// The current power levels
+	int leftPower = basePower;
+	int rightPower = basePower;
+	
+	unsigned long startTick = CurrentTick();
+	// Display
+	TextOut(0, LCD_LINE3, "Error: ");
+	
+	float rampValue = (basePowerHigh - basePowerLow) / rampUp;
+	while(true)
+	{
+		left = MotorRotationCount(LEFT);
+		right = MotorRotationCount(RIGHT);
+
+		// When we reach our goal
+		if(testGoal(left, targetDeg) )
+		{
+			Off(outputs);
+			break;
+		}
+		
+		// Tick counting
+		curTick = CurrentTick();
+		dt = curTick - lastTick;
+		
+		// Slow down when we get close
+		if(lowThreshDeg != 0)
+		{
+			if(abs(targetDeg - left) < lowThreshDeg) basePower = basePowerLow;
+			else basePower = basePowerLow + rampValue * (curTick - startTick);
+			
+			if(abs(basePower) > abs(basePowerHigh)) basePower = basePowerHigh;
+		}
+
+		
+		// Here comes the PID
+		int error = (right - left) / 2; // Proportional
+		totalError += error*dt; // Integral
+		int dErr = error - lastError; // Derivative
+
+		// Calculate results
+		int out = Kp * error + Ki * totalError / 1000 + Kd * dErr / dt;
+		leftPower = basePower + out;
+		rightPower = basePower - out;
+
+		// Bound motor power
+		if(leftPower > 100) leftPower = 100;
+		if(leftPower < -100) leftPower = -100;
+		if(rightPower > 100) rightPower = 100;
+		if(rightPower < -100) rightPower = -100;
+
+		// Set motor speeds
+		OnFwd(LEFT, leftPower);
+		OnFwd(RIGHT, rightPower);
+
+		TextOut(15, LCD_LINE1, "      /        ");
+		TextOut(15, LCD_LINE2, "      /        ");
+		NumOut(15, LCD_LINE1, left);
+		NumOut(15, LCD_LINE2, right);
+		NumOut(65, LCD_LINE1, leftPower);
+		NumOut(65, LCD_LINE2, rightPower);
+		
+		TextOut(45, LCD_LINE3, "             ");
+		NumOut(50, LCD_LINE3, totalError);
+
+		TextOut(0, LCD_LINE4, "             ");
+		NumOut(0, LCD_LINE4, rampValue);
+		// Save stuff
+		lastTick = curTick;
+		lastError = error;
+		Wait(5);
+	}
+}
+
+// Rotates the robot
+sub rotatePID(int targetDeg, int basePowerHigh, int basePowerLow, int lowThreshDeg, float Kp, float Ki, float Kd)
+{
+	// Left and right ticks
+	int left = 0;
+	int right = 0;
+
+	// Keeping track of errors
+	unsigned long lastTick = 0;
+	unsigned long curTick = 0;
+	int lastError = 0;
+	int dt = 0;
+
+	int totalError = 0; // The integral
+
+	// Setting up our outputs
+	byte outputs[] = {LEFT, RIGHT};
+	ResetAllTachoCounts(outputs);
+
+	// The base power
+	int basePower = basePowerHigh;
+
+	// The current power levels
+	int leftPower = basePower;
+	int rightPower = -basePower;
+
+	// Display
+	TextOut(0, LCD_LINE3, "Error: ");
+	while(true)
+	{
+		left = MotorRotationCount(LEFT);
+		right = MotorRotationCount(RIGHT);
+
+		// When we reach our goal
+		if(testGoal(left, targetDeg) )
+		{
+			Off(outputs);
+			break;
+		}
+
+		// Slow down when we get close
+		if(lowThreshDeg != 0)
+		{
+			if(abs(targetDeg - left) < lowThreshDeg) basePower = basePowerLow;
+		}
+
+		// Tick counting
+		curTick = CurrentTick();
+		dt = curTick - lastTick;
+
+		// Here comes the PID
+		int error = (abs(right) - abs(left)) / 2; // Proportional
+		totalError += error*dt; // Integral
+		int dErr = error - lastError; // Derivative
+
+		// Calculate results
+		int out = Kp * error + Ki * totalError / 100 + Kd * dErr / dt;
+		
+		if(targetDeg < 0)
+		{
+			out *= -1;
+		}
+		leftPower = basePower + out;
+		rightPower = -basePower + out;
+
+		// Bound motor power
+		if(leftPower > 100) leftPower = 100;
+		if(leftPower < -100) leftPower = -100;
+		if(rightPower > 100) rightPower = 100;
+		if(rightPower < -100) rightPower = -100;
+
+		// Set motor speeds
+		OnFwd(LEFT, leftPower);
+		OnFwd(RIGHT, rightPower);
+
+		TextOut(15, LCD_LINE1, "      /        ");
+		TextOut(15, LCD_LINE2, "      /        ");
+		NumOut(15, LCD_LINE1, left);
+		NumOut(15, LCD_LINE2, right);
+		NumOut(65, LCD_LINE1, leftPower);
+		NumOut(65, LCD_LINE2, rightPower);
+
+		NumOut(40, LCD_LINE3, totalError);
+
+		// Save stuff
+		lastTick = curTick;
+		lastError = error;
+		Wait(5);
+	}
+}
+
+// Initializes sensors
+sub setSensors()
+{
+	SetSensorType(LEFT_SENSOR, SENSOR_TYPE_LIGHT_ACTIVE);
+	SetSensorMode(LEFT_SENSOR, SENSOR_MODE_RAW);
+	
+	SetSensorType(CENTER_SENSOR, SENSOR_TYPE_COLORRED);
+	SetSensorMode(CENTER_SENSOR, SENSOR_MODE_RAW);
+	//SetSensorLight(S1, true);
+	SetSensorType(RIGHT_SENSOR, SENSOR_TYPE_LIGHT_ACTIVE);
+	SetSensorMode(RIGHT_SENSOR, SENSOR_MODE_RAW);
+	//SetSensorLight(S3, true);
+	
+	
+
+}
+
+sub clearSensors()
+{
+	SetSensorType(LEFT_SENSOR, SENSOR_TYPE_NONE);
+	SetSensorType(CENTER_SENSOR, SENSOR_TYPE_NONE);
+	SetSensorType(RIGHT_SENSOR, SENSOR_TYPE_NONE);
+}
+
+// Sends a list of n integers over bluetooth with the given packet type
+sub sendIntegers(int ints[], int n, unsigned int packetType)
+{
+	byte buf[];
+	int len = n*2+2;
+
+	ArrayInit(buf, 0, len);
+
+	buf[1] = packetType&0xFF;
+	unsigned int pt = packetType & 0xFF00;
+	pt = pt >> 8;
+	buf[0] = pt;
+
+	for(int i = 0; i < n; i++)
+	{
+		buf[i*2+2] = ints[i] & 0xFF;
+		unsigned int i2 = ints[i] & 0xFF00;
+		i2 = i2 >> 8;
+		buf[i*2+3] = i2;
+	}
+	sendPacket(buf);
+}
+
+// Calibration: Rotate around to get a full range of light readings from all sensors. Send numbers back.
+sub calibrate()
+{
+	setSensors();
+	// Left and right ticks
+	int left = 0;
+	int right = 0;
+
+	// Setting up our outputs
+	byte outputs[] = {LEFT, RIGHT};
+	ResetAllTachoCounts(outputs);
+
+	// The base power
+	int basePower = 30;
+
+	// The current power levels
+	int leftPower = basePower;
+	int rightPower = -basePower;
+
+	int phase = 0;
+	int targetDeg = 180;
+	int Kp = 10;
+	TextOut(0, LCD_LINE3, "SensorL: ");
+	TextOut(0, LCD_LINE4, "SensorR: ");
+	TextOut(0, LCD_LINE5, "SensorC: ");
+	unsigned int reading;
+	unsigned int readings[3];
+	sensorsHigh[LEFT_SENSOR] = Sensor(LEFT_SENSOR);
+	sensorsHigh[CENTER_SENSOR] = Sensor(CENTER_SENSOR);
+	sensorsHigh[RIGHT_SENSOR] = Sensor(RIGHT_SENSOR);
+	sensorsLow[LEFT_SENSOR] = sensorsHigh[LEFT_SENSOR];
+	sensorsLow[CENTER_SENSOR] = sensorsHigh[CENTER_SENSOR];
+	sensorsLow[RIGHT_SENSOR] = sensorsHigh[RIGHT_SENSOR];
+	while(true)
+	{
+		left = MotorRotationCount(LEFT);
+		right = MotorRotationCount(RIGHT);
+
+		// When we reach our goal
+		if(testGoal(left, targetDeg) )
+		{
+			targetDeg *= -1;
+			basePower *= -1;
+			if(phase == 1)
+			{
+				targetDeg = 0;
+			}
+			if(phase == 2)
+			{
+				Off(outputs);
+				break;
+			}
+			phase++;
+		}
+
+		// Calculate results
+		int error = (abs(right) - abs(left)) / 2; // Proportional
+		int out = Kp * error;
+		out = 0;
+		if(targetDeg < 0)
+		{
+			out *= -1;
+		}
+		leftPower = basePower + out;
+		rightPower = -basePower + out;
+
+		// Bound motor power
+		if(leftPower > 100) leftPower = 100;
+		if(leftPower < -100) leftPower = -100;
+		if(rightPower > 100) rightPower = 100;
+		if(rightPower < -100) rightPower = -100;
+
+		// Set motor speeds
+		OnFwd(LEFT, leftPower);
+		OnFwd(RIGHT, rightPower);
+
+		reading = Sensor(LEFT_SENSOR);
+		readings[0] = reading;
+		if(reading < sensorsLow[LEFT_SENSOR])
+		{
+			sensorsLow[LEFT_SENSOR] = reading;
+		}
+		if(reading > sensorsHigh[LEFT_SENSOR])
+		{
+			sensorsHigh[LEFT_SENSOR] = reading;
+		}
+		reading = Sensor(CENTER_SENSOR);
+		readings[1] = reading;
+		if(reading < sensorsLow[CENTER_SENSOR])
+		{
+			sensorsLow[CENTER_SENSOR] = reading;
+		}
+		if(reading > sensorsHigh[CENTER_SENSOR])
+		{
+			sensorsHigh[CENTER_SENSOR] = reading;
+		}
+		reading = Sensor(RIGHT_SENSOR);
+		readings[2] = reading;
+		if(reading < sensorsLow[RIGHT_SENSOR])
+		{
+			sensorsLow[RIGHT_SENSOR] = reading;
+		}
+		if(reading > sensorsHigh[RIGHT_SENSOR])
+		{
+			sensorsHigh[RIGHT_SENSOR] = reading;
+		}
+		//sendIntegers(readings, 3, 0xEF);
+		TextOut(50, LCD_LINE3, "    /        ");
+		TextOut(50, LCD_LINE4, "    /        ");
+		TextOut(50, LCD_LINE5, "    /        ");
+		NumOut(50, LCD_LINE3, sensorsLow[LEFT_SENSOR]);
+		NumOut(50, LCD_LINE4, sensorsLow[RIGHT_SENSOR]);
+		NumOut(50, LCD_LINE5, sensorsLow[CENTER_SENSOR]);
+		NumOut(80, LCD_LINE3, sensorsHigh[LEFT_SENSOR]);
+		NumOut(80, LCD_LINE4, sensorsHigh[RIGHT_SENSOR]);
+		NumOut(80, LCD_LINE5, sensorsHigh[CENTER_SENSOR]);
+		
+		TextOut(15, LCD_LINE1, "      /        ");
+		TextOut(15, LCD_LINE2, "      /        ");
+		NumOut(15, LCD_LINE1, left);
+		NumOut(15, LCD_LINE2, right);
+		NumOut(65, LCD_LINE1, leftPower);
+		NumOut(65, LCD_LINE2, rightPower);
+		Wait(5);
+	}
+	for(int i = 0; i < 3; i++)
+	{
+		threshHigh[i] = (sensorsHigh[i] + sensorsHigh[i] + sensorsLow[i]) / 3;
+		threshLow[i] = (sensorsHigh[i] + sensorsLow[i] + sensorsLow[i]) / 3;
+	}
+}
+
+float calcM()
+{
+	return (sensorsHigh[2] - sensorsLow[2])/(sensorsHigh[0] - sensorsLow[0]);
+}
+
+// Gets bearing error based on sensor readings
+int bearingError()
+{
+	int d0 = sensorsHigh[0] - sensorsLow[0];
+	int d2 = sensorsHigh[2] - sensorsLow[2];
+	int b = sensorsHigh[2] - sensorsHigh[0] * d2/d0;
+	int left = Sensor(LEFT_SENSOR);
+	int right = Sensor(RIGHT_SENSOR);
+	right = right*d2/d0+b;
+	int ret = left-right;
+	return ret;
+}
+
+// Tests whether the robot is on the goal
+bool isGoal()
+{
+	SetSensorColorFull(CENTER_SENSOR);
+
+	int color = Sensor(CENTER_SENSOR);
+	
+	SetSensorType(CENTER_SENSOR, SENSOR_TYPE_COLORRED);
+	SetSensorMode(CENTER_SENSOR, SENSOR_MODE_RAW);
+	SetSensorColorRed(CENTER_SENSOR);
+
+	return color == 2;
+}
+unsigned int sleepTime = 1;
+
+// Moves the robot in a straight line
+sub lineStraight(int intersectionGoal, int basePowerHigh, int basePowerLow, float Kp, float Ki, float Kd, float damping, int iSectDetectDelay)
+{
+	// Left and right ticks
+	int left = 0;
+	int right = 0;
+	
+	unsigned int leftSensor = Sensor(LEFT_SENSOR);
+	unsigned int centerSensor = Sensor(CENTER_SENSOR);
+	unsigned int rightSensor = Sensor(RIGHT_SENSOR);
+	unsigned int lastLeftSensor = leftSensor;
+	unsigned int lastCenterSensor = centerSensor;
+	unsigned int lastRightSensor = rightSensor;
+	
+	float isectRate = 0.0;
+	float dl = 0;
+	float dc = 0;
+	float dr = 0;
+	// Keeping track of errors
+	unsigned long lastTick = 0;
+	unsigned long curTick = 0;
+	int lastError = 0;
+	int dt = 0;
+
+	long totalError = 0; // The integral
+
+	// Setting up our outputs
+	byte outputs[] = {LEFT, RIGHT};
+	ResetAllTachoCounts(outputs);
+
+	// The base power
+	int basePower = basePowerHigh;
+	basePower = basePowerLow;
+
+	// The current power levels
+	int leftPower = basePower;
+	int rightPower = basePower;
+
+	unsigned long startTick = CurrentTick();
+	unsigned long nextBtCheck = 0;
+	// Display
+	TextOut(0, LCD_LINE3, "Error:                    ");
+	int pidOnTick = 0;
+	float rampValue = (basePowerHigh - basePowerLow) / rampUp;
+	int isectCount = 0;
+	
+	int isectDetectOnTick = 115*3;
+	
+	unsigned int intersectionStartTick = 0;
+	long intersectionError = 0;
+	long intersectionNormError = 0;
+	
+	int mode = PID_MODE;
+	unsigned int intersectionModeEnd = 0;
+	
+	unsigned int intersectionsPassed = 0;
+	
+	unsigned int nextBlueCheck = 0;
+	while(true)
+	{
+		leftSensor = Sensor(LEFT_SENSOR);
+		centerSensor = Sensor(CENTER_SENSOR);
+		rightSensor = Sensor(RIGHT_SENSOR);
+		dl = leftSensor - lastLeftSensor;
+		dc = centerSensor - lastCenterSensor;
+		dr = rightSensor - lastRightSensor;
+
+		bool l = leftSensor > threshHigh[LEFT_SENSOR];
+		bool r = rightSensor > threshHigh[RIGHT_SENSOR];
+		bool c = centerSensor > threshHigh[CENTER_SENSOR];
+
+		left = MotorRotationCount(LEFT);
+		right = MotorRotationCount(RIGHT);
+
+		// Tick counting
+		curTick = CurrentTick();
+		dt = curTick - lastTick;
+
+		// Ramp Up
+		basePower = basePowerLow + rampValue * (curTick - startTick);
+		if(abs(basePower) > abs(basePowerHigh)) basePower = basePowerHigh;
+
+
+		// Here comes the PID
+		int error = bearingError(); // Proportional
+		totalError = totalError*damping + error*dt; // Integral
+		int dErr = error - lastError; // Derivative
+
+		// Calculate results
+		int out = Kp * error + Ki * totalError / 1000 + Kd * dErr / dt;
+		
+		if(mode == INTERSECTION_MODE)
+		{
+			if(left > pidOnTick)
+			{
+				intersectionError /= 10;
+				intersectionNormError /= 10;
+				// Ending intersection mode
+				mode = PID_MODE;
+				unsigned int dTick = curTick - intersectionStartTick;
+				unsigned long relTick = (curTick - startTick);
+				int intersectionData[] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+				intersectionData[0] = leftSensor;
+				intersectionData[1] = centerSensor;
+				intersectionData[2] = rightSensor;
+				intersectionData[3] = left;
+				intersectionData[4] = right;
+				intersectionData[5] = relTick & 0xFFFF;
+				relTick = relTick & 0xFFFF0000;
+				intersectionData[6] = relTick >> 16;
+				intersectionData[7] = dTick;
+				intersectionData[8] = intersectionError & 0xFFFF;
+				intersectionError = intersectionError & 0xFFFF0000;
+				intersectionData[9] = intersectionError;
+				intersectionData[10] = intersectionNormError & 0xFFFF;
+				intersectionNormError = intersectionNormError & 0xFFFF0000;
+				intersectionData[11] = intersectionNormError;
+				TextOut(0, LCD_LINE8, "                   ");
+				NumOut(0, LCD_LINE8, intersectionError);
+				sendIntegers(intersectionData, 14, 0xEE55);
+				
+				//if(centerSensor > (sensorsHigh[CENTER_SENSOR] + sensorsLow[CENTER_SENSOR])/2)
+				if(centerSensor > threshLow[CENTER_SENSOR])
+				{
+					PlayToneEx(294,400,3,FALSE);
+					Float(outputs);
+					break;
+				}
+				else if(intersectionGoal != 0 && intersectionsPassed >= intersectionGoal)
+				{
+					PlayToneEx(294,400,3,FALSE);
+					Float(outputs);
+					break;
+				}
+				// Begin termination code
+				if(curTick > nextBlueCheck)
+				{
+					nextBlueCheck = curTick + 600;
+
+					if(!l && !r && !c && isGoal())
+					{
+						Float(outputs);
+						PlayToneEx (TONE_A5, 200, 3, false);
+						Wait(100);
+						PlayToneEx (TONE_C5, 200, 3, false);
+						Wait(100);
+						PlayToneEx (TONE_E5, 200, 3, false);
+						Wait(100);
+						PlayToneEx (TONE_G6, 200, 3, false);
+						Wait(100);
+
+						byte buf[] = {0xEE, 0x11, 0xFF};
+						sendPacket(buf);
+						break;
+					}
+				}
+				// End termination code
+			}
+			else
+			{
+				intersectionError += leftSensor - rightSensor;
+				intersectionNormError += error;
+			}
+			
+			out = 0;
+		}
+		else
+		{  
+			// Intersection detection
+			if(left > isectDetectOnTick)
+			{
+				// Dead end
+				if(l && r && c)
+				{
+					unsigned long pTick = (curTick - startTick);
+					int deadEndData[] = {0,0,0,0,0,0,0};
+					deadEndData[0] = leftSensor;
+					deadEndData[1] = centerSensor;
+					deadEndData[2] = rightSensor;
+					deadEndData[3] = left;
+					deadEndData[4] = right;
+					deadEndData[5] = pTick & 0xFFFF;
+					pTick = pTick & 0xFFFF0000;
+					deadEndData[6] = pTick >> 16;
+					sendIntegers(deadEndData, 7, 0xEE66);
+					Float(outputs);
+					break;
+				}
+				float errorRate = 1.0*dErr / dt;
+				if(errorRate < 0)
+				{
+					isectRate = isectRate*0.3-errorRate-dl/dt-dr/dt;
+				}
+				else
+				{
+					isectRate = isectRate*0.3+errorRate-dl/dt-dr/dt;
+				}
+
+				if(isectRate > 3)
+				{
+					intersectionsPassed++;
+					mode = INTERSECTION_MODE;
+					basePower = basePowerLow;
+					intersectionError = 0;
+					intersectionNormError = 0;
+					intersectionStartTick = curTick;
+					PlayToneEx(262,400,3,FALSE);
+					out = 0;
+					pidOnTick = left + 110;
+					isectDetectOnTick = left + 115*iSectDetectDelay;
+				}
+			}
+			
+		}
+
+
+		leftPower = basePower + out;
+		rightPower = basePower - out;
+		
+		// Bound motor power
+		if(leftPower > 100) leftPower = 100;
+		if(leftPower < -100) leftPower = -100;
+		if(rightPower > 100) rightPower = 100;
+		if(rightPower < -100) rightPower = -100;
+
+		// Set motor speeds
+		OnFwd(LEFT, leftPower);
+		OnFwd(RIGHT, rightPower);
+
+		TextOut(15, LCD_LINE1, "      /        ");
+		TextOut(15, LCD_LINE2, "      /        ");
+		NumOut(15, LCD_LINE1, left);
+		NumOut(15, LCD_LINE2, right);
+		NumOut(65, LCD_LINE1, leftPower);
+		NumOut(65, LCD_LINE2, rightPower);
+
+		TextOut(35, LCD_LINE3, "                   ");
+		NumOut(40, LCD_LINE3, totalError);
+
+		TextOut(0, LCD_LINE6, "   /    /   /       ");
+		NumOut(0, LCD_LINE6, Sensor(LEFT_SENSOR));
+		NumOut(25, LCD_LINE6, Sensor(CENTER_SENSOR));
+		NumOut(54, LCD_LINE6, Sensor(RIGHT_SENSOR));
+		NumOut(80, LCD_LINE6, error);
+		
+		//TextOut(0, LCD_LINE8, "                   ");
+		//NumOut(0, LCD_LINE8, dt);
+		// Save stuff
+		lastTick = curTick;
+		lastError = error;
+		lastLeftSensor = leftSensor;
+		lastCenterSensor = centerSensor;
+		lastRightSensor = rightSensor;
+		if(curTick > nextBtCheck)
+		{
+			string in = checkSecondary();
+			if(in == "HALT")
+			{
+				Float(outputs);
+				return;
+			}
+			nextBtCheck = curTick + 500;
+		}
+		
+		unsigned long pTick = (curTick - startTick);
+		int lrc[] = {0,0,0,0,0,0,0};
+		lrc[0] = leftSensor;
+		lrc[1] = centerSensor;
+		lrc[2] = rightSensor;
+		lrc[3] = left;
+		lrc[4] = right;
+		lrc[5] = pTick & 0xFFFF;
+		pTick = pTick & 0xFFFF0000;
+		lrc[6] = pTick >> 16;
+		//sendIntegers(lrc, 7, 0xEE44);
+
+
+		Wait(sleepTime);
+	}
+}
+
+// Sends an ACK packet for the incoming command
+sub sendAck(byte command[])
+{
+	until(BluetoothStatus(0)==NO_ERR);
+	byte buf[] = {0xBA, 0xAA, 0xFF, 0xFF, 0xFF, 0xFF};
+	buf[2] = command[0];
+	buf[3] = command[1];
+	buf[4] = command[2];
+	buf[5] = command[3];
+	BluetoothWrite(0, buf);
+}
+
+task main()
+{
+	string in;
+	byte outputs[] = {LEFT, RIGHT};
+
+	checkBT(0);
+	TextOut(0, LCD_LINE1, "L:  ");
+	TextOut(0, LCD_LINE2, "R: ");
+	TextOut(0, LCD_LINE6, "Last Message: ");
+	
+	int straightTarget = 0;
+	int straightBasePowerHigh = 80;
+	int straightBasePowerLow = 20;
+	//calibrate();
+	//calibrate();
+	//lineStraight(1500, 50, 20, 100, 0.1, 0.0, 0.0);
+	setSensors();
+	int bear = 1337;
+
+	byte command[];
+	while(true)
+	{
+		in = BTReceiveMessage(0, MAILBOX, TRUE);
+
+		if(in != "")
+		{
+
+			StrToByteArray(in, command);
+			in = SubStr(in, 4, StrLen(in)-4);
+			TextOut(0, LCD_LINE8, "                ");
+			TextOut(0, LCD_LINE8, in);
+			
+			if(in == "RESET TACH")
+			{
+				ResetRotationCount(outputs);
+			}
+			else if(beginsWith(in, "SET RAMPUP"))
+			{
+				rampUp = StrToNum(getToken(" ", in, 2));
+			}
+			else if(beginsWith(in, "SET SLEEPTIME"))
+			{
+				sleepTime = StrToNum(getToken(" ", in, 2));
+			}
+			else if(beginsWith(in, "SET COND"))
+			{
+				curCondition = getToken(" ", in, 2);
+			}
+			else if(in == "FUNNY")
+			{
+				byte buf[] = {0x00, 0xAB, 0x1C, 0x00, 0x02, 0xAA, 0xAB,
+					0xAA, 0xAB, 0xAA, 0xAB, 0xAA, 0xAB, 0xAA, 0xAB};
+				byte buf2[] ={0x44, 0x82, 0x49};
+				byte buf3[] ={0x44, 0x82, 0x50};
+				while(1)
+				{
+					BluetoothWrite(0,buf);
+					until(BluetoothStatus(0)==NO_ERR);
+					BluetoothWrite(0,buf2);
+					until(BluetoothStatus(0)==NO_ERR);
+					buf[3]++;
+					//BluetoothWrite(0,buf);
+					buf[4]++;
+					//BluetoothWrite(0,buf3);
+					Wait(3000);
+				}
+			}
+			else if(in == "CALIBRATE")
+			{
+				calibrate();
+				byte buf[] = {0xBA, 0xAA, 0xFF, 0xFF, 0xFF, 0xFF, 0xAA, 0xAB, 0xAA, 0xAB,
+					0xAA, 0xAB, 0xAA, 0xAB, 0xAA, 0xAB, 0xAA, 0xAB};
+				buf[2] = command[0];
+				buf[3] = command[1];
+				buf[4] = command[2];
+				buf[5] = command[3];
+				int idx = 6;
+				for(int i = 0; i < 3; i++)
+				{
+					idx = 6 + 2*i;
+					buf[idx] = (sensorsHigh[i] & 0xFF);
+					buf[idx+1] = (sensorsHigh[i] & 0xFF00) >> 8;
+				}
+				for(int i = 0; i < 3; i++)
+				{
+					idx = 12 + 2*i;
+					buf[idx] = (sensorsLow[i] & 0xFF);
+					buf[idx+1] = (sensorsLow[i] & 0xFF00) >> 8;
+				}
+				BluetoothWrite(0, buf);
+				continue;
+			}
+			else if(beginsWith(in, "PID_"))
+			{
+				ResetRotationCount(outputs);
+				int target = StrToNum(getToken(" ", in, 1));
+				int basePowerHigh = StrToNum(getToken(" ", in, 2));
+				int basePowerLow = StrToNum(getToken(" ", in, 3));
+				int lowThreshDeg = StrToNum(getToken(" ", in, 4));
+				float Kp = StrToNum(getToken(" ", in, 5));
+				float Ki = StrToNum(getToken(" ", in, 6));
+				float Kd = StrToNum(getToken(" ", in, 7));
+
+				if(beginsWith(in, "PID_STRAIGHT"))
+				{
+					target = getDegFromInches(target);
+					if(target < 0)
+					{
+						basePowerHigh *= -1;
+						basePowerLow *= -1;
+					}
+					moveStraightPID(target, basePowerHigh, basePowerLow, lowThreshDeg, Kp, Ki, Kd);
+				}
+				else if(beginsWith(in, "PID_ROTATE"))
+				{//PID_ROTATE -2034 90 20 60 3 0 0
+					float surfaceConst = StrToNum(getToken(" ", in, 8));
+					target = getDegFromRotate(target, surfaceConst);
+					if(target < 0)
+					{
+						basePowerHigh *= -1;
+						basePowerLow *= -1;
+					}
+					rotatePID(target, basePowerHigh, basePowerLow, lowThreshDeg, Kp, Ki, Kd);
+				}
+				else if(beginsWith(in, "PID_LINE"))
+				{
+					float damp = StrToNum(getToken(" ", in, 8));
+					int iSectDetectDelay = StrToNum(getToken(" ", in, 9));
+					lineStraight(target, basePowerHigh, basePowerLow, Kp, Ki, Kd, damp, iSectDetectDelay);
+				}
+			}
+			sendAck(command);
+		}
+		bool l = Sensor(LEFT_SENSOR) < threshLow[LEFT_SENSOR];
+		bool r = Sensor(RIGHT_SENSOR) < threshLow[RIGHT_SENSOR];
+		bool c = Sensor(CENTER_SENSOR) < threshLow[CENTER_SENSOR];
+		
+		string status = "+++";
+		if(l) status[0] = '-';
+		if(c) status[1] = '-';
+		if(r) status[2] = '-';
+		TextOut(0, LCD_LINE7, "       ");
+		TextOut(0, LCD_LINE7, status);
+		bear = bearingError();
+		TextOut(0, LCD_LINE6, "   /    /   /       ");
+		NumOut(0, LCD_LINE6, Sensor(LEFT_SENSOR));
+		NumOut(25, LCD_LINE6, Sensor(CENTER_SENSOR));
+		NumOut(54, LCD_LINE6, Sensor(RIGHT_SENSOR));
+		NumOut(80, LCD_LINE6, bear);
+		Wait(200);
+	}
+}
